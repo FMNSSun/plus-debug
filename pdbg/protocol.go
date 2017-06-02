@@ -7,7 +7,7 @@ import "encoding/binary"
 import "sync/atomic"
 import "time"
 
-const windowSize uint32 = 2
+const windowSize uint32 = 2048
 const maxPacketSize = 4096
 
 var mutex = &sync.Mutex{}
@@ -196,7 +196,7 @@ func (p *PDbg) readLoop() {
 			}
 
 			if p.inPackets[packetNo] != nil {
-				// duplicate packet?
+				p.log("DATA packet is duplicate: %d / %d", windowNumber, packetNo)
 			} else {
 				p.inPackets[packetNo] = buf[8:]
 			}
@@ -229,12 +229,10 @@ func (p *PDbg) readLoop() {
 	}
 }
 
-func (p *PDbg) waitAck(curWindow uint32, windowSize uint32) {
+func (p *PDbg) waitAck(curWindow uint32, windowSize uint32) bool {
 	p.log("Wait for ACK %d window size %d", curWindow, windowSize)
 
 	p.requestAck(curWindow, windowSize)
-
-	time.Sleep(10 * time.Millisecond)
 
 	select {
 		case ackedWindow := <- p.ackWait:
@@ -242,7 +240,7 @@ func (p *PDbg) waitAck(curWindow uint32, windowSize uint32) {
 				goto exitAck // wait for this window to be acked
 			}
 		default:
-			return
+			return false
 	}
 
 	exitAck:
@@ -254,6 +252,8 @@ func (p *PDbg) waitAck(curWindow uint32, windowSize uint32) {
 	}
 
 	atomic.AddUint32(&p.sendWindowNumber, 1)
+
+	return true
 }
 
 func (p *PDbg) writeLoop() {
@@ -262,6 +262,8 @@ func (p *PDbg) writeLoop() {
 	packetNo := uint32(0)
 
 	timer := time.NewTimer(1000 * time.Millisecond)
+
+	writeChan := p.writeChan
 
 	for {
 		select {
@@ -276,9 +278,13 @@ func (p *PDbg) writeLoop() {
 			// timeout
 			p.log("Send timeout occured")
 
-			p.waitAck(curWindow, packetNo)
-			packetNo = 0
-			timer.Reset(1000 * time.Millisecond)
+			writeChan = nil
+			if p.waitAck(curWindow, packetNo) {
+				packetNo = 0
+				writeChan = p.writeChan
+			}
+
+			timer.Reset(10 * time.Millisecond)
 			
 
 		case toResend := <- p.resendChan:
@@ -296,10 +302,10 @@ func (p *PDbg) writeLoop() {
 
 			timer.Reset(1000 * time.Millisecond)		
 
-		case toSend := <- p.writeChan:
+		case toSend := <- writeChan:
 			curWindow := atomic.LoadUint32(&p.sendWindowNumber)
 
-			buffer := make([]byte, maxPacketSize)
+			buffer := make([]byte, 96 + len(toSend))
 			copy(buffer[96:], toSend)
 	
 			buffer[0] = 0x00
@@ -319,10 +325,13 @@ func (p *PDbg) writeLoop() {
 			packetNo++
 
 			if packetNo == windowSize {
-
-				p.waitAck(curWindow, windowSize)
-
-				packetNo = 0
+				writeChan = nil // don't write when waiting for an ACK.
+				if p.waitAck(curWindow, windowSize) {
+					packetNo = 0
+					writeChan = p.writeChan
+				}
+				timer.Reset(10 * time.Millisecond)
+				continue
 			}
 
 			timer.Reset(1000 * time.Millisecond)

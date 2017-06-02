@@ -1,20 +1,20 @@
 package pdbg
 
-import "crypto/sha256"
+import "crypto/md5"
 import "bytes"
 
 
 type CryptoContext struct {
-	key		[]byte
-	secret  []byte
+	Key		[]byte
+	Secret  []byte
 }
 
 func (c *CryptoContext) encrypt(data []byte) {
-	keyLen := len(c.key)
+	keyLen := len(c.Key)
 	dataLen := len(data)
 
 	for i := 0; i < dataLen; i++ {
-		data[i] ^= c.key[i % keyLen]
+		data[i] ^= c.Key[i % keyLen]
 	}
 }
 
@@ -28,13 +28,13 @@ func (c *CryptoContext) EncryptAndProtect(plusHeader []byte, payload []byte) ([]
 	bufStart := buf[17:] // 0-15 is for checksum/secret afterwards, 16 for header len
 	buf[16] = byte(len(plusHeader))
 	_ = copy(bufStart, plusHeader)
-	_ = copy(bufStart[:len(plusHeader)], payload)
+	_ = copy(bufStart[len(plusHeader):], payload)
 
-	_ = copy(buf, c.secret)
+	_ = copy(buf, c.Secret)
 
 	c.encrypt(buf[16:])
 
-	hash := sha256.Sum256(buf)
+	hash := md5.Sum(buf)
 
 	if len(hash) != 16 {
 		panic("Hash has bogus length! BUG. REPORT THIS!")
@@ -51,10 +51,10 @@ func (c *CryptoContext) DecryptAndValidate(plusHeader []byte, payload []byte) ([
 	_ = copy(packetHash, payload[0:16])
 
 	// Set the secret
-	_ = copy(payload, c.secret)
+	_ = copy(payload, c.Secret)
 
 	// Compute the hash
-	hash_ := sha256.Sum256(payload)
+	hash_ := md5.Sum(payload)
 	hash := hash_[0:]
 
 	// If hashes are not equal something is fishy
