@@ -22,10 +22,24 @@ type PDbg struct {
 	readChan chan []byte
 	writeChan chan []byte
 	resendChan chan uint32
-	mutex *sync.Mutex
+	feedbackChan chan []byte
 	sendWindowNumber uint32
 	recvWindowNumber uint32
 	nextPacketNoSeq uint32
+}
+
+type feedbackChannel struct {
+	feedbackChan chan []byte
+	p *PDbg
+}
+
+func (ch *feedbackChannel) SendFeedback(data []byte) error {
+	ch.p.log("Need to send back feedback data %d", data)
+	select {
+		case ch.feedbackChan <- data:
+		default:
+	}
+	return nil
 }
 
 func (p *PDbg) log(message string, a ...interface{}) {
@@ -36,6 +50,7 @@ func (p *PDbg) log(message string, a ...interface{}) {
 		p.conn.LocalAddr().String(),
 		p.conn.RemoteAddr().String(),
 		fmt.Sprintf(message, a...))
+
 }
 
 func NewPDbg(conn *PLUS.Connection) *PDbg {
@@ -45,9 +60,12 @@ func NewPDbg(conn *PLUS.Connection) *PDbg {
 	p.writeChan = make(chan []byte, 8)
 	p.resendChan = make(chan uint32, 32)
 	p.ackWait = make(chan uint32, 1)
+	p.feedbackChan = make(chan []byte, 8)
 	p.sendWindowNumber = 0
 	p.recvWindowNumber = 0
 	p.nextPacketNoSeq = 0
+
+	conn.SetFeedbackChannel(&feedbackChannel { feedbackChan : p.feedbackChan, p : &p })
 
 	go p.readLoop()
 	go p.writeLoop()
@@ -180,6 +198,12 @@ func (p *PDbg) readLoop() {
 					}
 				}
 			}
+
+		case 0xAA:
+
+			p.log("PCF_FBCK packet received: %d", buf[5:])
+
+			p.conn.AddFeedbackData(buf[5:])
 				
 
 		case 0x00:
@@ -300,7 +324,20 @@ func (p *PDbg) writeLoop() {
 				panic("oops!")
 			}
 
-			timer.Reset(1000 * time.Millisecond)		
+			timer.Reset(1000 * time.Millisecond)
+
+		case feedback := <- p.feedbackChan:
+			curWindow := atomic.LoadUint32(&p.sendWindowNumber)
+
+			buffer := make([]byte, 1 + 4 + len(feedback))
+
+			copy(buffer[5:], feedback)
+			buffer[0] = 0xAA
+			binary.LittleEndian.PutUint32(buffer[1:], curWindow)
+
+			p.conn.Write(buffer)
+
+			p.log("Sent PCF_FBCK packet!")
 
 		case toSend := <- writeChan:
 			curWindow := atomic.LoadUint32(&p.sendWindowNumber)
