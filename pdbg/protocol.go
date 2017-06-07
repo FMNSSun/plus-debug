@@ -109,11 +109,13 @@ func (p *PDbg) readLoop() {
 
 	for {
 		buf := make([]byte, 4096)
-		_, err := p.conn.Read(buf)
+		n, err := p.conn.Read(buf)
 
 		if err != nil {
 			panic("oops!")
 		}
+
+		buf = buf[:n]
 
 		curWindow := p.recvWindowNumber
 		curSendWindow := atomic.LoadUint32(&p.sendWindowNumber)
