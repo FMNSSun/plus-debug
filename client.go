@@ -3,7 +3,7 @@ package main
 import "github.com/FMNSSun/plus-debug/pdbg"
 import "plus"
 import "net"
-//import "fmt"
+import "fmt"
 import "os"
 
 func main() {
@@ -37,7 +37,12 @@ func client(laddr string, raddr string) {
 	p.Write(buffer)
 
 	for {
-		p.Read(buffer)
+		_, err := p.Read(buffer)
+
+		if err != nil {
+			fmt.Printf("%s\n", err.Error())
+			break
+		}
 		//fmt.Printf("%d\n", buffer)
 	}
 }
