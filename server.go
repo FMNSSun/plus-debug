@@ -41,11 +41,12 @@ func server(laddr string) {
 
 		go func() {
 			p := pdbg.NewPDbg(connection)
-			for i := 0; i < 2048; i++ {
+			for i := 0; i < 4096; i++ {
 				q := byte(i % 256)
 				p.Write([]byte{q, 1, q, 2, q})
 				time.Sleep(1 * time.Millisecond)
 			}
+			p.Flush()
 			p.RequestClose()
 		}()
 	}

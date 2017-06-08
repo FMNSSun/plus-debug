@@ -7,6 +7,7 @@ import "encoding/binary"
 import "sync/atomic"
 import "time"
 import "errors"
+import "math/rand"
 
 const windowSize uint32 = 2048
 const maxPacketSize = 4096
@@ -28,6 +29,8 @@ type PDbg struct {
 	recvWindowNumber uint32
 	nextPacketNoSeq uint32
 	requestClose uint32
+	byeSent bool
+	byeChan chan bool
 	closed uint32
 }
 
@@ -49,7 +52,8 @@ func (p *PDbg) log(message string, a ...interface{}) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	fmt.Printf("%s\t\t%s\t\t%s\n",
+	fmt.Printf("%d\t%s\t\t%s\t\t%s\n",
+		time.Now().UnixNano() / int64(1000000),
 		p.conn.LocalAddr().String(),
 		p.conn.RemoteAddr().String(),
 		fmt.Sprintf(message, a...))
@@ -62,13 +66,15 @@ func NewPDbg(conn *PLUS.Connection) *PDbg {
 	p.readChan = make(chan []byte, 8)
 	p.writeChan = make(chan []byte, 8)
 	p.resendChan = make(chan uint32, 32)
-	p.ackWait = make(chan uint32, 1)
+	p.ackWait = make(chan uint32, 2)
 	p.feedbackChan = make(chan []byte, 8)
+	p.byeChan = make(chan bool, 1)
 	p.sendWindowNumber = 0
 	p.recvWindowNumber = 0
 	p.nextPacketNoSeq = 0
 	p.closed = 0
 	p.requestClose = 0
+	p.byeSent = false
 
 	conn.SetFeedbackChannel(&feedbackChannel { feedbackChan : p.feedbackChan, p : &p })
 
@@ -135,7 +141,9 @@ func (p *PDbg) ioReader(ch chan []byte) {
 			return
 		}
 
-		ch <- buf[:n]
+		if rand.Int() % 100 != 0 {
+			ch <- buf[:n]
+		}
 	}
 }
 
@@ -166,6 +174,15 @@ func (p *PDbg) Close() {
 	p.log("Closed conn!")
 
 	atomic.AddUint32(&p.closed, 1) // set closed to 1
+}
+
+func (p *PDbg) Flush() {
+	for {
+		if !p.HavePacketsOutstanding() {
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 }
 
 func (p *PDbg) readLoop() {
@@ -244,15 +261,10 @@ func (p *PDbg) readLoop() {
 				p.log("REQ_ACK window packet has window number %d > %d", windowNumber, curWindow)
 				continue // ignore it
 			} else if windowNumber < curWindow {
-				if !p.IsCloseRequested() {
-					p.log("REQ_ACK window packet for past window received. Re-acking... %d", windowNumber)
-					// We already acked this so uhm... re-ack it. 
-					p.sendAck(windowNumber) // don't ack currentWindow, ack the past window!
-					continue
-				} else {
-					p.log("Not re-acking because close was requested!")
-					continue
-				}
+				p.log("REQ_ACK window packet for past window received. Re-acking... %d", windowNumber)
+				// We already acked this so uhm... re-ack it. 
+				p.sendAck(windowNumber) // don't ack currentWindow, ack the past window!
+				continue
 			}
 
 			if p.nextPacketNoSeq == windowSize_ {
@@ -269,6 +281,7 @@ func (p *PDbg) readLoop() {
 
 				p.log("Await packet of next window")
 				p.nextPacketNoSeq = 0
+
 			} else {
 				// Let's see what we need to request
 				for i := uint32(0); i < windowSize_; i++ {
@@ -291,7 +304,13 @@ func (p *PDbg) readLoop() {
 		case 0x77:
 
 			p.log("BYE packet received!")
-			p.RequestClose()
+
+			select {
+				case p.byeChan <- true:
+				default:
+			}
+
+			p.bye()
 
 		case 0x00:
 			// It's a packet
@@ -328,6 +347,8 @@ func (p *PDbg) readLoop() {
 				for i := p.nextPacketNoSeq; i < windowSize; i++ {
 					if p.inPackets[i] != nil {
 						p.nextPacketNoSeq++
+					} else {
+						break
 					}
 
 					select {
@@ -335,6 +356,8 @@ func (p *PDbg) readLoop() {
 						default:
 					}
 				}
+
+				p.log("Forward scanned to %d", p.nextPacketNoSeq)
 			}
 		}
 	}
@@ -366,11 +389,38 @@ func (p *PDbg) waitAck(curWindow uint32, windowSize uint32) bool {
 
 	if atomic.LoadUint32(&p.requestClose) != 0 {
 		// Close was requested so...
-		p.log("Close was requested and last window was acked so let's close this.")
-		p.Close() //close it
+		p.log("Close was requested and last window was acked so let's bye this.")
+		if p.HavePacketsOutstanding() {
+			p.log("Have outstanding packets. Can't bye yet tho!")
+		} else {
+			p.sendBye(curWindow)
+		}
 	}
 
 	return true
+}
+
+func (p *PDbg) HavePacketsOutstanding() bool {
+	if len(p.writeChan) > 0 || len(p.resendChan) > 0 {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (p *PDbg) bye() {
+	p.log("Bye")
+	curWindow := atomic.LoadUint32(&p.sendWindowNumber)
+	p.sendBye(curWindow)
+	p.byeSent = true
+	go func() {
+		time.Sleep(1000 * time.Millisecond)
+		p.log("Bye timeout")
+		select {
+			case p.byeChan <- true:
+			default:
+		}
+	}()
 }
 
 func (p *PDbg) IsClosed() bool {
@@ -391,8 +441,6 @@ func (p *PDbg) RequestClose() {
 		p.log("Request close!")
 	}
 
-	curWindow := atomic.LoadUint32(&p.sendWindowNumber)
-	p.sendBye(curWindow)
 	atomic.StoreUint32(&p.requestClose, 1)
 }
 
@@ -413,12 +461,13 @@ func (p *PDbg) writeLoop() {
 		}
 
 		select {
-		case _ = <- heloTimer.C:
-			if atomic.LoadUint32(&p.requestClose) != 0 {
-				p.log("Request close. Stop sending HELO packets!")
-				return
+		case _ = <- p.byeChan:
+			p.log("Close negotiated!")
+			if p.byeSent {
+				p.Close()
 			}
 
+		case _ = <- heloTimer.C:			
 			curWindow := atomic.LoadUint32(&p.sendWindowNumber)
 
 			p.sendHelo(curWindow)
@@ -430,6 +479,11 @@ func (p *PDbg) writeLoop() {
 
 			if packetNo == 0 {
 				p.log("Send timeout but no packet was sent anyway!")
+
+				if p.IsCloseRequested() {
+					p.sendBye(curWindow)
+				}
+
 				continue
 			}
 
@@ -458,7 +512,7 @@ func (p *PDbg) writeLoop() {
 				panic("oops!")
 			}
 
-			timer.Reset(1000 * time.Millisecond)
+			timer.Reset(10 * time.Millisecond)
 
 		case feedback := <- p.feedbackChan:
 			curWindow := atomic.LoadUint32(&p.sendWindowNumber)
@@ -510,7 +564,6 @@ func (p *PDbg) writeLoop() {
 				timer.Reset(10 * time.Millisecond)
 				continue
 			}
-
 			timer.Reset(1000 * time.Millisecond)
 		}
 	}
