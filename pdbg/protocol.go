@@ -1,6 +1,6 @@
 package pdbg
 
-import "plus"
+import "github.com/mami-project/plus-lib"
 import "fmt"
 import "sync"
 import "encoding/binary"
@@ -500,8 +500,6 @@ func (p *PDbg) writeLoop() {
 			
 
 		case toResend := <- p.resendChan:
-			p.log("HTNH")
-
 			data := p.outPackets[toResend]
 
 			_, err := p.conn.Write(data)

@@ -1,7 +1,7 @@
 package main
 
 import "github.com/FMNSSun/plus-debug/pdbg"
-import "plus"
+import "github.com/mami-project/plus-lib"
 import "net"
 import "fmt"
 import "os"
